@@ -7,7 +7,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/xtaci/kcp-go/v5"
+	"github.com/etnperlong/kcp-go/v5"
 	"golang.org/x/crypto/pbkdf2"
 )
 
