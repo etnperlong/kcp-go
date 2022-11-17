@@ -90,6 +90,7 @@ type (
 		payloadOffset int       // ICKP_OVERHEAD + headerSize
 		ackNoDelay    bool      // send ack immediately for each incoming packet(testing purpose)
 		writeDelay    bool      // delay kcp.flush() for Write() for bulk transfer
+		rapidFec      bool      // force fec encode on updater invoked
 		dup           int       // duplicate udp packets(testing purpose)
 
 		// notifications
@@ -467,6 +468,19 @@ func (s *UDPSession) SetACKNoDelay(nodelay bool) {
 	s.ackNoDelay = nodelay
 }
 
+// SetRapidFec toggles the rapid fec mode of/off
+func (s *UDPSession) SetRapidFec(enable bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rapidFec = enable
+}
+
+func (s *UDPSession) SetRapidFecMinInterval(duration time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fecEncoder.setForceEncodeMinInterval(duration)
+}
+
 // (deprecated)
 //
 // SetDUP duplicates udp packets for kcp output.
@@ -580,22 +594,72 @@ func (s *UDPSession) output(buf []byte) {
 	}
 
 	// 4. TxQueue
-	var msg ipv4.Message
+	// var msg ipv4.Message
 	for i := 0; i < s.dup+1; i++ {
-		bts := xmitBuf.Get().([]byte)[:len(buf)]
-		copy(bts, buf)
-		msg.Buffers = [][]byte{bts}
-		msg.Addr = s.remote
-		s.txqueue = append(s.txqueue, msg)
+		s.append2Queue(buf)
+		/*
+			bts := xmitBuf.Get().([]byte)[:len(buf)]
+			copy(bts, buf)
+			msg.Buffers = [][]byte{bts}
+			msg.Addr = s.remote
+			s.txqueue = append(s.txqueue, msg)
+		*/
 	}
 
 	for k := range ecc {
-		bts := xmitBuf.Get().([]byte)[:len(ecc[k])]
-		copy(bts, ecc[k])
-		msg.Buffers = [][]byte{bts}
-		msg.Addr = s.remote
-		s.txqueue = append(s.txqueue, msg)
+		s.append2Queue(ecc[k])
+		/*
+			bts := xmitBuf.Get().([]byte)[:len(ecc[k])]
+			copy(bts, ecc[k])
+			msg.Buffers = [][]byte{bts}
+			msg.Addr = s.remote
+			s.txqueue = append(s.txqueue, msg)
+		*/
 	}
+}
+
+func (s *UDPSession) forceFecEncode() {
+	if s.fecEncoder == nil {
+		return
+	}
+	pb, ps := s.fecEncoder.forceEncode()
+	if pb == nil || ps == nil {
+		return
+	}
+
+	if s.block != nil {
+		for k := range pb {
+			s.calculateCRC32AndEncrypt(pb[k])
+		}
+		for k := range ps {
+			s.calculateCRC32AndEncrypt(ps[k])
+		}
+	}
+
+	for k := range pb {
+		for i := 0; i < s.dup+1; i++ {
+			s.append2Queue(pb[k])
+		}
+	}
+	for k := range ps {
+		s.append2Queue(ps[k])
+	}
+}
+
+func (s *UDPSession) calculateCRC32AndEncrypt(buf []byte) {
+	s.nonce.Fill(buf[:nonceSize])
+	checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
+	binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
+	s.block.Encrypt(buf, buf)
+}
+
+func (s *UDPSession) append2Queue(buf []byte) {
+	var msg ipv4.Message
+	bts := xmitBuf.Get().([]byte)[:len(buf)]
+	copy(bts, buf)
+	msg.Buffers = [][]byte{bts}
+	msg.Addr = s.remote
+	s.txqueue = append(s.txqueue, msg)
 }
 
 // sess update to trigger protocol
@@ -607,6 +671,9 @@ func (s *UDPSession) update() {
 		interval := s.kcp.flush(false)
 		waitsnd := s.kcp.WaitSnd()
 		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+			if s.rapidFec {
+				s.forceFecEncode()
+			}
 			s.notifyWriteEvent()
 		}
 		s.uncork()
@@ -701,54 +768,58 @@ func (s *UDPSession) kcpInput(data []byte) {
 	if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
 		if len(data) >= fecHeaderSizePlus2 {
 			f := fecPacket(data)
-			if f.flag() == typeParity {
-				fecParityShards++
-			}
-
-			// lock
-			s.mu.Lock()
-			// if fecDecoder is not initialized, create one with default parameter
-			if s.fecDecoder == nil {
-				s.fecDecoder = newFECDecoder(1, 1)
-			}
-			recovers := s.fecDecoder.decode(f)
-			if f.flag() == typeData {
-				if ret := s.kcp.Input(data[fecHeaderSizePlus2:], true, s.ackNoDelay); ret != 0 {
-					kcpInErrors++
+			if f.flag() == typeData || f.flag() == typeParity || f.flag() == typePadding { // header check
+				if f.flag() == typeParity {
+					fecParityShards++
 				}
-			}
 
-			for _, r := range recovers {
-				if len(r) >= 2 { // must be larger than 2bytes
-					sz := binary.LittleEndian.Uint16(r)
-					if int(sz) <= len(r) && sz >= 2 {
-						if ret := s.kcp.Input(r[2:sz], false, s.ackNoDelay); ret == 0 {
-							fecRecovered++
+				// lock
+				s.mu.Lock()
+				// if fecDecoder is not initialized, create one with default parameter
+				if s.fecDecoder == nil {
+					s.fecDecoder = newFECDecoder(1, 1)
+				}
+				recovers := s.fecDecoder.decode(f)
+				if f.flag() == typeData {
+					if ret := s.kcp.Input(data[fecHeaderSizePlus2:], true, s.ackNoDelay); ret != 0 {
+						kcpInErrors++
+					}
+				}
+
+				for _, r := range recovers {
+					if len(r) >= 2 { // must be larger than 2bytes
+						sz := binary.LittleEndian.Uint16(r)
+						if int(sz) <= len(r) && sz >= 2 {
+							if ret := s.kcp.Input(r[2:sz], false, s.ackNoDelay); ret == 0 {
+								fecRecovered++
+							} else {
+								kcpInErrors++
+							}
 						} else {
-							kcpInErrors++
+							fecErrs++
 						}
 					} else {
 						fecErrs++
 					}
-				} else {
-					fecErrs++
+					// recycle the recovers
+					xmitBuf.Put(r)
 				}
-				// recycle the recovers
-				xmitBuf.Put(r)
-			}
 
-			// to notify the readers to receive the data
-			if n := s.kcp.PeekSize(); n > 0 {
-				s.notifyReadEvent()
-			}
-			// to notify the writers
-			waitsnd := s.kcp.WaitSnd()
-			if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
-				s.notifyWriteEvent()
-			}
+				// to notify the readers to receive the data
+				if n := s.kcp.PeekSize(); n > 0 {
+					s.notifyReadEvent()
+				}
+				// to notify the writers
+				waitsnd := s.kcp.WaitSnd()
+				if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+					s.notifyWriteEvent()
+				}
 
-			s.uncork()
-			s.mu.Unlock()
+				s.uncork()
+				s.mu.Unlock()
+			} else {
+				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			}
 		} else {
 			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 		}
